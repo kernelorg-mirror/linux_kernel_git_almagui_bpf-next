@@ -124,6 +124,13 @@ struct btf_dump {
 	 */
 	struct hashmap *ident_names;
 	/*
+	 * maps BTF string offset to a copy of that string with characters
+	 * that are not valid in C identifiers replaced by '_'; only
+	 * populated for names that need such replacement (e.g., Rust names
+	 * like "core::option::Option<u32>").
+	 */
+	struct hashmap *c_names;
+	/*
 	 * data for typed display; allocated if needed.
 	 */
 	struct btf_dump_data *typed_dump;
@@ -139,9 +146,149 @@ static bool str_equal_fn(long a, long b, void *ctx)
 	return strcmp((void *)a, (void *)b) == 0;
 }
 
+static size_t c_name_hash_fn(long key, void *ctx)
+{
+	return key;
+}
+
+static bool c_name_equal_fn(long a, long b, void *ctx)
+{
+	return a == b;
+}
+
 static const char *btf_name_of(const struct btf_dump *d, __u32 name_off)
 {
 	return btf__name_by_offset(d->btf, name_off);
+}
+
+static bool is_c_ident_char(char c, bool first)
+{
+	if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_')
+		return true;
+	return !first && c >= '0' && c <= '9';
+}
+
+/*
+ * Return name at name_off, usable as a C identifier. Names emitted by
+ * non-C languages (e.g., Rust) can contain characters such as ':', '<',
+ * '>', '{', '#' or ' ' that are not valid in C identifiers; replace each
+ * such character with '_'. Valid names are returned as is.
+ */
+static const char *btf_dump_c_name(struct btf_dump *d, __u32 name_off)
+{
+	const char *name = btf_name_of(d, name_off);
+	char *new_name;
+	int i;
+
+	for (i = 0; name[i]; i++) {
+		if (!is_c_ident_char(name[i], i == 0))
+			break;
+	}
+	if (!name[i])
+		return name;
+
+	if (hashmap__find(d->c_names, name_off, &new_name))
+		return new_name;
+
+	new_name = strdup(name);
+	if (!new_name)
+		return name;
+
+	for (; new_name[i]; i++) {
+		if (!is_c_ident_char(new_name[i], i == 0))
+			new_name[i] = '_';
+	}
+
+	if (hashmap__add(d->c_names, name_off, new_name)) {
+		free(new_name);
+		return name;
+	}
+	return new_name;
+}
+
+static int c_int_name_size(const struct btf_dump *d, const char *name)
+{
+	static const struct {
+		const char *name;
+		int size; /* 0 means pointer size */
+	} c_ints[] = {
+		{ "_Bool", 1 },
+		{ "char", 1 },
+		{ "signed char", 1 },
+		{ "unsigned char", 1 },
+		{ "short", 2 },
+		{ "short int", 2 },
+		{ "unsigned short", 2 },
+		{ "short unsigned int", 2 },
+		{ "int", 4 },
+		{ "unsigned int", 4 },
+		{ "long", 0 },
+		{ "long int", 0 },
+		{ "unsigned long", 0 },
+		{ "long unsigned int", 0 },
+		{ "long long", 8 },
+		{ "long long int", 8 },
+		{ "unsigned long long", 8 },
+		{ "long long unsigned int", 8 },
+		{ "__int128", 16 },
+		{ "unsigned __int128", 16 },
+		{ "__int128 unsigned", 16 },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(c_ints); i++) {
+		if (strcmp(name, c_ints[i].name) == 0)
+			return c_ints[i].size ?: d->ptr_sz;
+	}
+	return -1;
+}
+
+/*
+ * Return a C name for an INT or FLOAT type. Non-C languages (e.g., Rust)
+ * use names like "u8", "usize" or "f64" for their primitive types, or
+ * reuse C names with different sizes (Rust's "char" is 4 bytes). If the
+ * name is not a C type name of the right size, derive the C type from the
+ * type's encoding and size instead.
+ */
+static const char *btf_dump_base_type_name(const struct btf_dump *d,
+					   const struct btf_type *t)
+{
+	const char *name = btf_name_of(d, t->name_off);
+	bool is_signed;
+	__u8 enc;
+
+	if (btf_is_float(t)) {
+		if (strcmp(name, "float") == 0 || strcmp(name, "double") == 0 ||
+		    strcmp(name, "long double") == 0)
+			return name;
+		switch (t->size) {
+		case 4: return "float";
+		case 8: return "double";
+		default: return name;
+		}
+	}
+
+	if (c_int_name_size(d, name) == t->size)
+		return name;
+
+	enc = btf_int_encoding(t);
+	if (enc & BTF_INT_BOOL)
+		return t->size == 1 ? "_Bool" : name;
+	is_signed = enc & BTF_INT_SIGNED;
+
+	if (t->size == d->ptr_sz)
+		return is_signed ? "long" : "unsigned long";
+	switch (t->size) {
+	case 1:
+		if (enc & BTF_INT_CHAR)
+			return "char";
+		return is_signed ? "signed char" : "unsigned char";
+	case 2: return is_signed ? "short" : "unsigned short";
+	case 4: return is_signed ? "int" : "unsigned int";
+	case 8: return is_signed ? "long long" : "unsigned long long";
+	case 16: return is_signed ? "__int128" : "unsigned __int128";
+	default: return name;
+	}
 }
 
 static void btf_dump_printf(const struct btf_dump *d, const char *fmt, ...)
@@ -189,6 +336,12 @@ struct btf_dump *btf_dump__new(const struct btf *btf,
 	if (IS_ERR(d->ident_names)) {
 		err = PTR_ERR(d->ident_names);
 		d->ident_names = NULL;
+		goto err;
+	}
+	d->c_names = hashmap__new(c_name_hash_fn, c_name_equal_fn, NULL);
+	if (IS_ERR(d->c_names)) {
+		err = PTR_ERR(d->c_names);
+		d->c_names = NULL;
 		goto err;
 	}
 
@@ -291,6 +444,8 @@ static void btf_dump_free_names(struct hashmap *map)
 
 void btf_dump__free(struct btf_dump *d)
 {
+	struct hashmap_entry *cur;
+	size_t bkt;
 	int i;
 
 	if (IS_ERR_OR_NULL(d))
@@ -310,6 +465,11 @@ void btf_dump__free(struct btf_dump *d)
 	free(d->decl_stack);
 	btf_dump_free_names(d->type_names);
 	btf_dump_free_names(d->ident_names);
+	if (d->c_names) {
+		hashmap__for_each_entry(d->c_names, cur, bkt)
+			free(cur->pvalue);
+		hashmap__free(d->c_names);
+	}
 
 	free(d);
 }
@@ -1080,7 +1240,7 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
 		int m_off, m_sz, m_align;
 		bool in_bitfield;
 
-		fname = btf_name_of(d, m->name_off);
+		fname = btf_dump_c_name(d, m->name_off);
 		m_sz = btf_member_bitfield_size(t, i);
 		m_off = btf_member_bit_offset(t, i);
 		m_align = packed ? 1 : btf__align_of(d->btf, m->type);
@@ -1169,7 +1329,7 @@ static void btf_dump_emit_enum32_val(struct btf_dump *d,
 	int i;
 
 	for (i = 0; i < vlen; i++, v++) {
-		name = btf_name_of(d, v->name_off);
+		name = btf_dump_c_name(d, v->name_off);
 		/* enumerators share namespace with typedef idents */
 		dup_cnt = btf_dump_name_dups(d, d->ident_names, name);
 		if (dup_cnt > 1) {
@@ -1195,7 +1355,7 @@ static void btf_dump_emit_enum64_val(struct btf_dump *d,
 	int i;
 
 	for (i = 0; i < vlen; i++, v++) {
-		name = btf_name_of(d, v->name_off);
+		name = btf_dump_c_name(d, v->name_off);
 		dup_cnt = btf_dump_name_dups(d, d->ident_names, name);
 		val = btf_enum64_value(v);
 		if (dup_cnt > 1) {
@@ -1549,8 +1709,7 @@ static void btf_dump_emit_type_chain(struct btf_dump *d,
 		case BTF_KIND_INT:
 		case BTF_KIND_FLOAT:
 			btf_dump_emit_mods(d, decls);
-			name = btf_name_of(d, t->name_off);
-			btf_dump_printf(d, "%s", name);
+			btf_dump_printf(d, "%s", btf_dump_base_type_name(d, t));
 			break;
 		case BTF_KIND_STRUCT:
 		case BTF_KIND_UNION:
@@ -1684,7 +1843,7 @@ static void btf_dump_emit_type_chain(struct btf_dump *d,
 					break;
 				}
 
-				name = btf_name_of(d, p->name_off);
+				name = btf_dump_c_name(d, p->name_off);
 				btf_dump_emit_type_decl(d, p->type, name, lvl);
 			}
 
@@ -1765,7 +1924,7 @@ static const char *btf_dump_resolve_name(struct btf_dump *d, __u32 id,
 {
 	struct btf_dump_type_aux_state *s = &d->type_states[id];
 	const struct btf_type *t = btf__type_by_id(d->btf, id);
-	const char *orig_name = btf_name_of(d, t->name_off);
+	const char *orig_name = btf_dump_c_name(d, t->name_off);
 	const char **cached_name = &d->cached_names[id];
 	size_t dup_cnt;
 
