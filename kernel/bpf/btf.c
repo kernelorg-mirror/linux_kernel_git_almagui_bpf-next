@@ -919,21 +919,23 @@ static bool btf_name_valid_identifier(const struct btf *btf, u32 offset)
 {
 	/* offset must be valid */
 	const char *src = btf_str_by_offset(btf, offset);
-	const char *src_limit;
 
 	if (!isprint(*src))
 		return false;
 
-	/* set a limit on identifier length */
-	src_limit = src + KSYM_NAME_LEN;
+	/*
+	 * No length limit: Rust type names can be arbitrarily long.  The
+	 * walk is bounded since btf_parse_str_sec() ensures the string
+	 * section is NUL-terminated.
+	 */
 	src++;
-	while (*src && src < src_limit) {
+	while (*src) {
 		if (!isprint(*src))
 			return false;
 		src++;
 	}
 
-	return !*src;
+	return true;
 }
 
 /* Allow any printable character in DATASEC names */
