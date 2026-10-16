@@ -11640,14 +11640,72 @@ static int find_btf_by_prefix_kind(const struct btf *btf, const char *prefix,
 	return btf__find_by_name_kind(btf, btf_type_name, kind);
 }
 
+#define BTF_RUST_LINKAGE_PREFIX "rust:linkage:"
+#define LINKAGE_TAG_MAX_WARN 8
+
+/* Rust FUNC names are DWARF names (e.g. "blob_read<kernel::str::CString>")
+ * rather than symbol names, and one FUNC can describe multiple
+ * monomorphized symbols. Each symbol is recorded in a
+ * "rust:linkage:<symbol>" decl tag on its FUNC; the kernel accepts the tag
+ * id as attach target, resolving it to the FUNC and symbol.
+ *
+ * Find the linkage tag for a FUNC named @name, or for the mangled symbol
+ * @name. Returns -ENOENT if there is none, or -ENOTUNIQ if @name is the
+ * FUNC name for multiple symbols; the mangled name then disambiguates.
+ */
+static int find_btf_linkage_tag(const struct btf *btf, const char *name)
+{
+	const size_t plen = sizeof(BTF_RUST_LINKAGE_PREFIX) - 1;
+	const struct btf *base = btf__base_btf(btf);
+	__u32 i, n = btf__type_cnt(btf);
+	int id = -ENOENT, cnt = 0;
+
+	for (i = base ? btf__type_cnt(base) : 1; i < n; i++) {
+		const struct btf_type *t = btf__type_by_id(btf, i), *ft;
+		const char *tag, *fname;
+
+		if (!btf_is_decl_tag(t) || btf_decl_tag(t)->component_idx != -1)
+			continue;
+		tag = btf__name_by_offset(btf, t->name_off);
+		if (!tag || strncmp(tag, BTF_RUST_LINKAGE_PREFIX, plen) != 0)
+			continue;
+		ft = btf__type_by_id(btf, t->type);
+		if (!ft || !btf_is_func(ft))
+			continue;
+		if (strcmp(tag + plen, name) == 0)
+			return i;
+		fname = btf__name_by_offset(btf, ft->name_off);
+		if (!fname || strcmp(fname, name) != 0)
+			continue;
+		if (cnt++ == 1)
+			pr_warn("'%s' matches multiple Rust symbols, use a mangled name:\n  %s\n",
+				name, btf__name_by_offset(btf, btf__type_by_id(btf, id)->name_off) + plen);
+		if (cnt > 1 && cnt <= LINKAGE_TAG_MAX_WARN)
+			pr_warn("  %s\n", tag + plen);
+		id = i;
+	}
+	if (cnt > LINKAGE_TAG_MAX_WARN)
+		pr_warn("  ... (%d more)\n", cnt - LINKAGE_TAG_MAX_WARN);
+	return cnt > 1 ? -ENOTUNIQ : id;
+}
+
 static inline int find_attach_btf_id(struct btf *btf, const char *name,
 				     enum bpf_attach_type attach_type)
 {
 	const char *prefix;
-	int kind;
+	int kind, ret;
 
 	btf_get_kernel_prefix_kind(attach_type, &prefix, &kind);
-	return find_btf_by_prefix_kind(btf, prefix, name, kind);
+	if (prefix[0] || kind != BTF_KIND_FUNC)
+		return find_btf_by_prefix_kind(btf, prefix, name, kind);
+
+	/* Rust functions are attached via their linkage tag; other
+	 * functions via their FUNC.
+	 */
+	ret = find_btf_linkage_tag(btf, name);
+	if (ret == -ENOENT)
+		ret = btf__find_by_name_kind(btf, name, kind);
+	return ret;
 }
 
 int libbpf_find_vmlinux_btf_id(const char *name,
@@ -11714,8 +11772,9 @@ static int find_kernel_btf_id(struct bpf_object *obj, const char *attach_name,
 	int ret, i, mod_len = 0;
 	const char *fn_name, *mod_name = NULL;
 
+	/* "module:func"; a "::" is a Rust path separator, not a module */
 	fn_name = strchr(attach_name, ':');
-	if (fn_name) {
+	if (fn_name && fn_name[1] != ':') {
 		mod_name = attach_name;
 		mod_len = fn_name - mod_name;
 		fn_name++;
