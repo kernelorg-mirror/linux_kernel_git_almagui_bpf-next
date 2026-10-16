@@ -22178,6 +22178,32 @@ static int check_attach_modify_return(unsigned long addr, const char *func_name)
 
 #endif /* CONFIG_FUNCTION_ERROR_INJECTION */
 
+#define BTF_RUST_LINKAGE_PREFIX "rust:linkage:"
+
+/*
+ * Rust FUNC names are DWARF names, not symbol names, and one FUNC can
+ * describe several monomorphized symbols. Such functions are attached to
+ * via the id of a "rust:linkage:<symbol>" decl tag on the FUNC; resolve it
+ * to the FUNC id and the symbol name to look up. Other ids are unchanged.
+ */
+static u32 btf_resolve_linkage_tag(const struct btf *btf, u32 btf_id,
+				   const char **sym)
+{
+	const struct btf_type *t = btf_type_by_id(btf, btf_id);
+	const char *name;
+
+	if (!t || btf_kind(t) != BTF_KIND_DECL_TAG ||
+	    btf_decl_tag(t)->component_idx != -1)
+		return btf_id;
+	name = btf_name_by_offset(btf, t->name_off);
+	if (!name || !str_has_prefix(name, BTF_RUST_LINKAGE_PREFIX))
+		return btf_id;
+	if (!btf_type_is_func(btf_type_by_id(btf, t->type)))
+		return btf_id;
+	*sym = name + strlen(BTF_RUST_LINKAGE_PREFIX);
+	return t->type;
+}
+
 static bool is_tracing_multi_id(const struct bpf_prog *prog, u32 btf_id)
 {
 	return is_tracing_multi(prog->expected_attach_type) && bpf_multi_func_btf_id[0] == btf_id;
@@ -22431,6 +22457,10 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 	if (!tname) {
 		bpf_log(log, "attach_btf_id %u doesn't have a name\n", btf_id);
 		return -EINVAL;
+	}
+	if (!tgt_prog) {
+		btf_id = btf_resolve_linkage_tag(btf, btf_id, &tname);
+		t = btf_type_by_id(btf, btf_id);
 	}
 	if (tgt_prog) {
 		struct bpf_prog_aux *aux = tgt_prog->aux;
@@ -22952,6 +22982,15 @@ int bpf_check_attach_btf_id_multi(struct btf *btf, struct bpf_prog *prog, u32 bt
 	if (!btf_id || !btf)
 		return -EINVAL;
 
+	/* Check and get function target data. */
+	t = btf_type_by_id(btf, btf_id);
+	if (!t)
+		return -EINVAL;
+	tname = btf_name_by_offset(btf, t->name_off);
+	if (!tname)
+		return -EINVAL;
+	btf_id = btf_resolve_linkage_tag(btf, btf_id, &tname);
+
 	/* Check noreturn attachment. */
 	if ((prog->expected_attach_type == BPF_TRACE_FEXIT_MULTI ||
 	     prog->expected_attach_type == BPF_TRACE_FSESSION_MULTI) &&
@@ -22961,13 +23000,6 @@ int bpf_check_attach_btf_id_multi(struct btf *btf, struct bpf_prog *prog, u32 bt
 	if (btf_id_set_contains(&btf_id_deny, btf_id))
 		return -EINVAL;
 
-	/* Check and get function target data. */
-	t = btf_type_by_id(btf, btf_id);
-	if (!t)
-		return -EINVAL;
-	tname = btf_name_by_offset(btf, t->name_off);
-	if (!tname)
-		return -EINVAL;
 	t = btf_attach_func_proto(NULL, btf, btf_id);
 	if (!t || !btf_type_is_func_proto(t))
 		return -EINVAL;
