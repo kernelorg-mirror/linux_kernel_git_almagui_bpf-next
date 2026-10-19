@@ -1056,9 +1056,19 @@ ifdef CONFIG_HAVE_FENTRY
     CC_FLAGS_FTRACE	+= -mfentry
     CC_FLAGS_USING	+= -DCC_USING_FENTRY
   endif
+  # Rust call sites are recorded in __mcount_loc by objtool; the target.json
+  # declares fentry support starting with Rust 1.98.0.
+  ifdef CONFIG_X86_64
+    ifdef CONFIG_FTRACE_MCOUNT_USE_OBJTOOL
+      ifneq ($(call rustc-min-version,109800),)
+        RUSTC_FLAGS_FTRACE	:= -Zinstrument-mcount=fentry
+      endif
+    endif
+  endif
 endif
-export CC_FLAGS_FTRACE
+export CC_FLAGS_FTRACE RUSTC_FLAGS_FTRACE
 KBUILD_CFLAGS	+= $(CC_FLAGS_FTRACE) $(CC_FLAGS_USING)
+KBUILD_RUSTFLAGS += $(RUSTC_FLAGS_FTRACE)
 KBUILD_AFLAGS	+= $(CC_FLAGS_USING)
 endif
 

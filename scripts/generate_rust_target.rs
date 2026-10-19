@@ -237,6 +237,11 @@ fn main() {
         } else {
             ts.push("target-pointer-width", "64");
         }
+        if cfg.rustc_version_atleast(1, 98, 0) {
+            // Allow `-Zinstrument-mcount=fentry` so Rust functions get `__fentry__` calls
+            // like C code built with `-mfentry`.
+            ts.push("supports-fentry", true);
+        }
     } else if cfg.has("X86_32") {
         // This only works on UML, as i386 otherwise needs regparm support in rustc
         if !cfg.has("UML") {
